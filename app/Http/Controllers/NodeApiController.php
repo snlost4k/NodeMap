@@ -44,16 +44,21 @@ class NodeApiController extends Controller
         }
 
         if ($iface !== '') {
+            $iface = strtolower(trim($iface));
             $query->whereExists(function($s) use ($iface) {
                 $s->select(DB::raw(1))
-                  ->from('node_interfaces as ni')
-                  ->whereColumn('ni.id', 'nodes.id')
-                  ->where('ni.interface_name', $iface);
+                ->from('node_interfaces as ni')
+                ->whereColumn('ni.id', 'nodes.id')
+                ->whereRaw('LOWER(ni.interface_name) LIKE ?', ['%' . $iface . '%']);
             });
         }
 
+
         // return compact marker payload
-        $nodes = $query->limit($limit)->get()->map(function($n) {
+        $nodes = $query->limit($limit)->get()->map(function ($n) {
+            $lat = optional($n->geo)->lat;
+            $lng = optional($n->geo)->lng;
+
             return [
                 'id'        => $n->id,
                 'node_id'   => $n->node_id,
@@ -62,17 +67,106 @@ class NodeApiController extends Controller
                 'continent' => $n->continent,
                 'vendors'   => $n->vendors->pluck('vendor_name')->values(),
                 'interfaces'=> $n->interfaces->pluck('interface_name')->values(),
-                'lat'       => optional($n->geo) ? (float) $n->geo->lat : null, // <-- cast
-                'lng'       => optional($n->geo) ? (float) $n->geo->lng : null, // <-- cast
+                'lat'       => is_null($lat) ? null : (float) $lat,
+                'lng'       => is_null($lng) ? null : (float) $lng,
             ];
         });
 
         return response()->json(['data' => $nodes]);
     }
+    public function markers(Request $req)
+    {
+        $q         = trim((string) $req->query('q', ''));
+        $continent = trim((string) $req->query('continent', ''));
+        $vendor    = trim((string) $req->query('vendor', ''));
+        $iface     = trim((string) $req->query('interface', ''));
+        $limit     = min((int) $req->query('limit', 1000), 2000); // hard cap
+        $cursor    = (int) $req->query('cursor', 0);              // simple id cursor
+
+        // Optional viewport bounding box (fetch only what’s on-screen)
+        $north = $req->query('north'); $south = $req->query('south');
+        $east  = $req->query('east');  $west  = $req->query('west');
+
+        $query = \App\Models\Node::query()
+            ->select('nodes.id', 'nodes.name')
+            ->with(['geo:id,lat,lng'])
+            ->where('nodes.id', '>', $cursor) // cursor-based pagination
+            ->orderBy('nodes.id', 'asc');
+
+        if ($q !== '') {
+            $query->where(function($w) use ($q) {
+                $w->where('address', 'like', "%{$q}%")
+                ->orWhere('name', 'like', "%{$q}%");
+            });
+        }
+        if ($continent !== '') {
+            $query->where('continent', $continent);
+        }
+        if ($vendor !== '') {
+            $query->whereExists(function($s) use ($vendor) {
+                $s->selectRaw(1)->from('node_vendors as nv')
+                ->whereColumn('nv.id', 'nodes.id')
+                ->where('nv.vendor_name', $vendor);
+            });
+        }
+        if ($iface !== '') {
+            $query->whereExists(function($s) use ($iface) {
+                $s->selectRaw(1)->from('node_interfaces as ni')
+                ->whereColumn('ni.id', 'nodes.id')
+                ->where('ni.interface_name', $iface);
+            });
+        }
+
+        // Apply bbox only if all 4 provided
+        $useBbox = is_numeric($north) && is_numeric($south) && is_numeric($east) && is_numeric($west);
+
+        // Pull a bit more than limit to see if there’s a next page
+        $rows = $query->limit($limit + 1)->get();
+
+        // Map to lean markers
+        $markers = [];
+        foreach ($rows as $n) {
+            $lat = optional($n->geo)->lat;
+            $lng = optional($n->geo)->lng;
+            if (is_null($lat) || is_null($lng)) continue;
+
+            $lat = (float)$lat; $lng = (float)$lng;
+            if ($useBbox) {
+                if ($lat > (float)$north || $lat < (float)$south) continue;
+                // Handle antimeridian: for simplicity assume west<east; if your use case crosses,
+                // we can add wrap logic.
+                if ($lng < (float)$west || $lng > (float)$east) continue;
+            }
+
+            $markers[] = [
+                'id'   => $n->id,
+                'lat'  => $lat,
+                'lng'  => $lng,
+                'name' => $n->name,
+            ];
+
+            if (count($markers) === $limit) break;
+        }
+
+        // Compute next cursor if we grabbed at least one row beyond limit
+        $nextCursor = null;
+        if ($rows->count() > $limit) {
+            $nextCursor = $rows->last()->id;
+        } elseif (!empty($markers)) {
+            $nextCursor = end($markers)['id'];
+        }
+
+        return response()->json([
+            'data'        => $markers,
+            'next_cursor' => $nextCursor,
+        ]);
+    }
 
     public function show($id)
     {
         $n = Node::with(['vendors:vendor_name', 'interfaces:interface_name', 'geo:id,lat,lng'])->findOrFail((int)$id);
+        $lat = optional($n->geo)->lat;
+        $lng = optional($n->geo)->lng;
 
         return response()->json([
             'id'        => $n->id,
@@ -82,8 +176,8 @@ class NodeApiController extends Controller
             'continent' => $n->continent,
             'vendors'   => $n->vendors->pluck('vendor_name')->values(),
             'interfaces'=> $n->interfaces->pluck('interface_name')->values(),
-            'lat'       => optional($n->geo) ? (float) $n->geo->lat : null,
-            'lng'       => optional($n->geo) ? (float) $n->geo->lng : null,
+            'lat'       => is_null($lat) ? null : (float) $lat,
+            'lng'       => is_null($lng) ? null : (float) $lng,
         ]);
     }
 }
